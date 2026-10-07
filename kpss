@@ -1,0 +1,168 @@
+import os
+import sqlite3
+import time
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+# Ortam değişkenlerini yükle (.env dosyasından)
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+DB_NAME = "ilanlar.db"
+
+# Filtre Kriterleri
+HEDEF_BOLUMLER = ["sbky", "siyaset bilimi", "kamu yönetimi", "4503", "iibf", "iktisadi ve idari"]
+HEDEF_NITELIKLER = ["6225", "bilgisayar işletmeni", "büro personeli", "sertifika"]
+HEDEF_ILLER = [
+    "artvin", "erzurum", "kars", "van", "ağrı", "hakkari", 
+    "bitlis", "muş", "ığdır", "ardahan", "bingöl", "tunceli", 
+    "elazığ", "erzincan", "gümüşhane", "bayburt", "doğu"
+]
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+def init_db():
+    """Veritabanını ve tabloyu oluşturur."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ilanlar (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ilan_id TEXT UNIQUE,
+            baslik TEXT,
+            link TEXT,
+            tarih TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def ilan_var_mi(ilan_id: str) -> bool:
+    """İlanın veritabanında önceden kayıtlı olup olmadığını kontrol eder."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM ilanlar WHERE ilan_id = ?", (ilan_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+def ilan_kaydet(ilan_id: str, baslik: str, link: str):
+    """Yeni ilanı veritabanına kaydeder."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO ilanlar (ilan_id, baslik, link) VALUES (?, ?, ?)", (ilan_id, baslik, link))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+    finally:
+        conn.close()
+
+def telegram_mesaj_gonder(baslik: str, link: str, sehir: str):
+    """Bulunan ilanı Telegram botu üzerinden bildirim olarak iletir."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[!] Telegram token veya chat ID tanımlanmamış.")
+        return
+
+    mesaj = (
+        f"🚨 **YENİ UYGUN İLAN BULUNDU!**\n\n"
+        f"📌 **Başlık:** {baslik}\n"
+        f"📍 **Konum:** {sehir}\n"
+        f"🎯 **Uyumlu Filtre:** SBKY / 4503 / 6225\n\n"
+        f"🔗 [İlana Gitmek İçin Tıklayın]({link})"
+    )
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": mesaj,
+        "parse_mode": "Markdown"
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            print(f"[+] Telegram bildirimi gönderildi: {baslik}")
+        else:
+            print(f"[-] Telegram bildirimi başarısız: {response.text}")
+    except Exception as e:
+        print(f"[!] Bildirim gönderimi sırasında hata: {e}")
+
+def metin_uygun_mu(metin: str) -> tuple[bool, str]:
+    """İlan başlığının belirlenen kriterlere uyup uymadığını denetler."""
+    metin_lower = metin.lower()
+    
+    bolum_uygun = any(b in metin_lower for b in HEDEF_BOLUMLER)
+    nitelik_uygun = any(n in metin_lower for n in HEDEF_NITELIKLER)
+    
+    tespit_edilen_il = "Doğu / Karadeniz"
+    il_uygun = False
+    for il in HEDEF_ILLER:
+        if il in metin_lower:
+            il_uygun = True
+            tespit_edilen_il = il.capitalize()
+            break
+            
+    if bolum_uygun and nitelik_uygun and il_uygun:
+        return True, tespit_edilen_il
+        
+    return False, ""
+
+def kamu_ilan_tara():
+    """Kamu İlan Portalı'nı (kamuilan.sbb.gov.tr) tarar."""
+    url = "https://kamuilan.sbb.gov.tr/"
+    bulunan_ilanlar = []
+    
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, "html.parser")
+            for link_tag in soup.find_all("a", href=True):
+                baslik = link_tag.text.strip()
+                link = link_tag['href']
+                if not link.startswith("http"):
+                    link = "https://kamuilan.sbb.gov.tr/" + link.lstrip("/")
+                
+                uygun, il = metin_uygun_mu(baslik)
+                if uygun:
+                    bulunan_ilanlar.append({
+                        "id": link,
+                        "baslik": baslik,
+                        "link": link,
+                        "sehir": il
+                    })
+    except Exception as e:
+        print(f"[!] Tarama sırasında hata oluştu: {e}")
+        
+    return bulunan_ilanlar
+
+def calistir():
+    """Ana çalıştırma döngüsü."""
+    print("=" * 50)
+    print("🚀 Kamu İlan Takip Botu Başlatılıyor...")
+    print("=" * 50)
+    
+    init_db()
+    
+    print("[*] SBB Kamu İlan Portalı taranıyor...")
+    ilanlar = kamu_ilan_tara()
+    
+    yeni_sayisi = 0
+    for ilan in ilanlar:
+        if not ilan_var_mi(ilan["id"]):
+            print(f"[!] Yeni Uyumlu İlan Yakalandı: {ilan['baslik']}")
+            ilan_kaydet(ilan["id"], ilan["baslik"], ilan["link"])
+            telegram_mesaj_gonder(ilan["baslik"], ilan["link"], ilan["sehir"])
+            yeni_sayisi += 1
+            time.sleep(1)
+            
+    print("-" * 50)
+    print(f"✅ Tarama tamamlandı. {yeni_sayisi} yeni ilan kaydedildi ve bildirildi.")
+    print("-" * 50)
+
+if __name__ == "__main__":
+    calistir()
